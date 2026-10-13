@@ -1,0 +1,325 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import pandas as pd
+from sklearn.datasets import fetch_openml
+import os
+
+np.random.seed(42)
+SHOW_PLOTS = not os.environ.get('HIDE_PLOTS', False)
+
+
+housing = fetch_openml(name="house_prices", as_frame=True)
+X = housing.data
+y = pd.to_numeric(housing.target, errors="coerce").astype(np.float64).to_numpy()
+
+def split_data(X, y, train_size=0.7, val_size=0.15, test_size=0.15, random_state=42):
+    assert abs(train_size + val_size + test_size - 1.0) < 1e-8, \
+        "train_size + val_size + test_size must sum to 1."
+
+    X_train, X_remaining, y_train, y_remaining = train_test_split(X, y, train_size=train_size, random_state=random_state)
+    X_val, X_test, y_val, y_test = train_test_split(X_remaining, y_remaining, train_size=val_size / (val_size + test_size), random_state=random_state)
+
+    return (X_train.copy(), X_val.copy(), X_test.copy(), y_train.copy(), y_val.copy(), y_test.copy())
+X_train, X_val, X_test, y_train, y_val, y_test = split_data(X, y)
+
+print(f"[Split] Train: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
+
+numerical_features   = X_train.select_dtypes(include=np.number).columns.tolist()
+categorical_features = X_train.select_dtypes(exclude=np.number).columns.tolist()
+
+print(f"[DTypes] Numerical: {len(numerical_features)} | Categorical: {len(categorical_features)}")
+
+# (a)(ii)
+def impute_data(X_train, X_val, X_test, features, strategy="median"):
+    X_train, X_val, X_test = X_train.copy(), X_val.copy(), X_test.copy()
+
+    if strategy == "median":
+        fill_values = X_train[features].median().fillna(0)
+    elif strategy == "mode":
+        fill_values = {}
+        for feature in features:
+            modes = X_train[feature].mode(dropna=True)
+            fill_values[feature] = modes.iloc[0] if not modes.empty else "Missing"
+    else:
+        raise ValueError("strategy must be 'median' or 'mode'")
+
+    X_train.loc[:, features] = X_train[features].fillna(fill_values)
+    X_val.loc[:, features] = X_val[features].fillna(fill_values)
+    X_test.loc[:, features] = X_test[features].fillna(fill_values)
+
+    return X_train, X_val, X_test
+X_train, X_val, X_test = impute_data(X_train, X_val, X_test, numerical_features, strategy="median")
+
+if len(categorical_features) > 0:
+    X_train, X_val, X_test = impute_data(X_train, X_val, X_test, categorical_features, strategy="mode")
+
+print("[Impute] Done (train medians/modes applied).")
+
+if len(categorical_features) > 0:
+    X_train_cat = pd.get_dummies(X_train[categorical_features], drop_first=True, dtype=float)
+    X_val_cat   = pd.get_dummies(X_val[categorical_features],   drop_first=True, dtype=float)
+    X_test_cat  = pd.get_dummies(X_test[categorical_features],  drop_first=True, dtype=float)
+    train_cols  = X_train_cat.columns
+    X_val_cat   = X_val_cat.reindex(columns=train_cols,  fill_value=0.0)
+    X_test_cat  = X_test_cat.reindex(columns=train_cols, fill_value=0.0)
+else:
+    X_train_cat = pd.DataFrame(index=X_train.index)
+    X_val_cat   = pd.DataFrame(index=X_val.index)
+    X_test_cat  = pd.DataFrame(index=X_test.index)
+
+print(f"[One-Hot] Train categorical columns: {X_train_cat.shape[1]}")
+
+def zscore_transform(X, mean, std):
+    Z = (X - mean) / std
+    return Z
+
+
+train_mean = X_train[numerical_features].mean()
+train_std  = X_train[numerical_features].std(ddof=0).replace(0, 1)
+
+
+X_train_num = zscore_transform(X_train[numerical_features], train_mean, train_std)
+X_val_num   = zscore_transform(X_val[numerical_features],   train_mean, train_std)
+X_test_num  = zscore_transform(X_test[numerical_features],  train_mean, train_std)
+
+X_train_processed = pd.concat([X_train_num, X_train_cat], axis=1).astype(np.float64)
+X_val_processed   = pd.concat([X_val_num,   X_val_cat],   axis=1).astype(np.float64)
+X_test_processed  = pd.concat([X_test_num,  X_test_cat],  axis=1).astype(np.float64)
+
+final_feature_names = X_train_processed.columns.tolist()
+print(f"[Processed] Train design shape: {X_train_processed.shape}")
+
+X_train_np = X_train_processed.to_numpy(dtype=np.float64)
+X_val_np   = X_val_processed.to_numpy(dtype=np.float64)
+X_test_np  = X_test_processed.to_numpy(dtype=np.float64)
+
+X_train_b = np.c_[np.ones((X_train_np.shape[0], 1)), X_train_np]
+X_val_b   = np.c_[np.ones((X_val_np.shape[0],   1)), X_val_np]
+X_test_b  = np.c_[np.ones((X_test_np.shape[0],  1)), X_test_np]
+
+print(f"[Bias] X_train_b shape: {X_train_b.shape} (includes bias)")
+
+def mean_squared_error(y_true, y_pred):
+    return np.mean((y_pred - y_true) ** 2)
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def ols_solve_predict(X_train_b, y_train, X_test_b):
+    w_ols = np.linalg.pinv(X_train_b.T @ X_train_b) @ X_train_b.T @ y_train
+    y_pred = X_test_b @ w_ols
+    return w_ols, y_pred
+
+w_ols, y_pred_ols = ols_solve_predict(X_train_b, y_train, X_test_b)
+mse_ols = mean_squared_error(y_test, y_pred_ols)
+rmse_ols = rmse(y_test, y_pred_ols)
+print(f"[OLS] Test MSE: {mse_ols:.4f} | RMSE ($): {rmse_ols:,.2f}")
+
+import numpy as np
+from sklearn.metrics import mean_squared_error
+
+
+def ridge_precompute(X_train_b, y_train):
+    """
+    Compute matrices for closed-form ridge regression.
+    Returns: I, XtX, Xty
+    """
+
+    d = X_train_b.shape[1]
+    I = np.eye(d, dtype=np.float64)
+    I[0, 0] = 0.0  
+    XtX = X_train_b.T @ X_train_b
+    Xty = X_train_b.T @ y_train
+    return I, XtX, Xty
+
+
+def ridge_solve_predict(XtX, Xty, I, best_lambda, X_test_b):
+    w_ridge = np.linalg.solve(XtX + best_lambda * I, Xty)
+    y_pred_ridge = X_test_b @ w_ridge
+    return w_ridge, y_pred_ridge
+
+I, XtX, Xty = ridge_precompute(X_train_b, y_train)
+ridge_lambdas = [0.1, 1, 10, 100, 500, 1000]
+train_mses_ridge, val_mses_ridge = [], []
+
+for l in ridge_lambdas:
+    w, y_train_pred = ridge_solve_predict(XtX, Xty, I, l, X_train_b)
+    _, y_val_pred   = ridge_solve_predict(XtX, Xty, I, l, X_val_b)
+    train_mses_ridge.append(mean_squared_error(y_train, y_train_pred))
+    val_mses_ridge.append(mean_squared_error(y_val,   y_val_pred))
+
+best_idx = int(np.argmin(val_mses_ridge))
+best_lambda_ridge = ridge_lambdas[best_idx]
+
+w_ridge, y_pred_ridge = ridge_solve_predict(XtX, Xty, I, best_lambda_ridge, X_test_b)
+
+mse_ridge = mean_squared_error(y_test, y_pred_ridge)
+rmse_ridge = rmse(y_test, y_pred_ridge)
+
+print(f"[Ridge-Closed] Best λ={best_lambda_ridge}")
+print(f"[Ridge-Closed] Test MSE: {mse_ridge:.4f} | RMSE ($): {rmse_ridge:,.2f}")
+
+if SHOW_PLOTS:
+    plt.figure()
+    plt.plot(ridge_lambdas, train_mses_ridge, 'o-', label='Train MSE')
+    plt.plot(ridge_lambdas, val_mses_ridge,   'o-', label='Val MSE')
+    plt.xscale('log'); plt.xlabel('λ (Ridge)'); plt.ylabel('MSE'); plt.grid(True, ls='--')
+    plt.title('Ridge: Train/Val MSE vs λ'); plt.axvline(best_lambda_ridge, linestyle='--')
+    plt.legend(); plt.show()
+
+def lipschitz_constant_data(X):
+    d = X.shape[1]
+    v = np.random.randn(d); v /= (np.linalg.norm(v) + 1e-12)
+    for _ in range(100):
+        v = X.T @ (X @ v)
+        v /= (np.linalg.norm(v) + 1e-12)
+    lam_max = float(v @ (X.T @ (X @ v)))
+    return (2.0 / X.shape[0]) * lam_max
+
+L_data = lipschitz_constant_data(X_train_b)
+import numpy as np
+def compute_gradient(X, y, w):
+    n = X.shape[0]
+    grad = (2.0 / n) * X.T @ (X @ w - y)
+    return grad
+
+def check_early_stop(w, w_prev, tol):
+    return np.linalg.norm(w - w_prev, ord=np.inf) < tol
+
+
+def ista_lasso(X, y, alpha, n_iterations, lambda_val, tol=1e-8):
+    n, d = X.shape
+    w = np.zeros(d, dtype=np.float64)
+    thr = alpha * lambda_val
+
+    for _ in range(n_iterations):
+        w_prev = w.copy()
+        grad = compute_gradient(X, y, w)
+        w -= alpha * grad
+        z = w[1:].copy()
+        w[1:] = np.sign(z) * np.maximum(np.abs(z) - thr, 0.0)
+        if check_early_stop(w, w_prev, tol):
+            break
+
+    return w
+
+alpha_lasso = 0.9 / L_data
+lasso_iters = 6000
+lasso_lambdas = np.logspace(1, 6, num=10) 
+
+lasso_val_mses, lasso_ws = [], []
+for l in lasso_lambdas:
+    w = ista_lasso(X_train_b, y_train, alpha_lasso, lasso_iters, l)
+    lasso_ws.append(w)
+    lasso_val_mses.append(mean_squared_error(y_val, X_val_b @ w))
+
+best_idx_lasso = int(np.argmin(lasso_val_mses))
+best_lambda_lasso = float(lasso_lambdas[best_idx_lasso])
+w_lasso = lasso_ws[best_idx_lasso]
+mse_lasso = mean_squared_error(y_test, X_test_b @ w_lasso)
+rmse_lasso = rmse(y_test, X_test_b @ w_lasso)
+
+nonzeros_ols   = int(np.sum(np.abs(w_ols[1:])   > 1e-12))
+nonzeros_ridge = int(np.sum(np.abs(w_ridge[1:]) > 1e-12))
+nonzeros_lasso = int(np.sum(np.abs(w_lasso[1:]) > 1e-12))
+total_features = X_train_np.shape[1]
+
+print(f"[Lasso-ISTA] Best λ={best_lambda_lasso:.2e} | Test MSE: {mse_lasso:.4f} | RMSE ($): {rmse_lasso:,.2f}")
+print(f"[Sparsity] OLS={nonzeros_ols}/{total_features}, Ridge={nonzeros_ridge}/{total_features}, Lasso={nonzeros_lasso}/{total_features}")
+
+feature_names = ['Bias'] + final_feature_names
+weights_df = pd.DataFrame({
+    'Feature': feature_names,
+    'OLS_Weights': w_ols,
+    'Ridge_Weights (best λ)': w_ridge,
+    'Lasso_Weights (best λ)': w_lasso
+})
+top10 = weights_df.reindex(
+    weights_df['Lasso_Weights (best λ)'].abs().sort_values(ascending=False).index
+).head(10).round(3)
+print("\n[Top-10 |Lasso weights|]\n", top10)
+
+
+y_train_series = pd.Series(y_train)
+y_train_log = np.log1p(y_train_series)
+
+skew_raw = float(y_train_series.skew())
+skew_log = float(y_train_log.skew())
+print(f"[Skew] SalePrice: {skew_raw:.3f} | log1p(SalePrice): {skew_log:.3f}")
+
+if SHOW_PLOTS:
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.hist(y_train, bins=40)
+    plt.title(f"SalePrice (train) — skew={skew_raw:.2f}")
+    plt.subplot(1, 2, 2)
+    plt.hist(np.log1p(y_train), bins=40)
+    plt.title(f"log1p(SalePrice) (train) — skew={skew_log:.2f}")
+    plt.tight_layout(); plt.show()
+
+def smear_back_transform(y_train_log, train_pred_log, X_test_b, w):
+    residuals_log = np.asarray(y_train_log) - np.asarray(train_pred_log)
+    smear = float(np.mean(np.exp(residuals_log)))
+    test_pred_log = X_test_b @ w
+    y_pred_back = np.expm1(test_pred_log) * smear
+    return smear, y_pred_back
+
+print("Part 4: Log-Transform + Duan's Smearing (Ridge & Lasso)")
+
+y_train_log = np.log1p(y_train)
+y_val_log   = np.log1p(y_val)
+y_test_log  = np.log1p(y_test)
+
+I, XtX, Xty_log = ridge_precompute(X_train_b, y_train_log)
+val_mses_log_ridge, ridge_ws_log = [], []
+for l in ridge_lambdas:
+    w_ridge_log_l, y_val_ridge = ridge_solve_predict(XtX, Xty_log, I, l, X_val_b)
+    ridge_ws_log.append(w_ridge_log_l)
+    val_mses_log_ridge.append(mean_squared_error(y_val_log, y_val_ridge))
+
+best_idx_ridge_log = int(np.argmin(val_mses_log_ridge))
+best_lambda_ridge_log = ridge_lambdas[best_idx_ridge_log]
+w_ridge_log = ridge_ws_log[best_idx_ridge_log]
+train_pred_log_ridge = X_train_b @ w_ridge_log
+smear_ridge, y_pred_ridge_log_back = smear_back_transform( y_train_log, train_pred_log_ridge, X_test_b, w_ridge_log)
+mse_ridge_log_back  = mean_squared_error(y_test, y_pred_ridge_log_back)
+rmse_ridge_log_back = rmse(y_test, y_pred_ridge_log_back)
+lasso_lambdas_log = np.logspace(-3, 2, num=16)  
+lasso_iters_log = 20_000
+lasso_val_mses_log, lasso_ws_log = [], []
+for l in lasso_lambdas_log:
+    w = ista_lasso(X_train_b, y_train_log, alpha_lasso, lasso_iters_log, l)
+    lasso_ws_log.append(w)
+    lasso_val_mses_log.append(mean_squared_error(y_val_log, X_val_b @ w))
+
+best_idx_lasso_log = int(np.argmin(lasso_val_mses_log))
+best_lambda_lasso_log = float(lasso_lambdas_log[best_idx_lasso_log])
+w_lasso_log = lasso_ws_log[best_idx_lasso_log]
+
+train_pred_log_lasso = X_train_b @ w_lasso_log
+smear_lasso, y_pred_lasso_log_back = smear_back_transform( y_train_log, train_pred_log_lasso, X_test_b, w_lasso_log)
+mse_lasso_log_back  = mean_squared_error(y_test, y_pred_lasso_log_back)
+rmse_lasso_log_back = rmse(y_test, y_pred_lasso_log_back)
+
+print(f"[Ridge-LOG] Best λ={best_lambda_ridge_log} | MSE: {mse_ridge_log_back:.4f} | RMSE ($): {rmse_ridge_log_back:,.2f}")
+print(f"[Lasso-LOG] Best λ={best_lambda_lasso_log:.2e} | MSE: {mse_lasso_log_back:.4f} | RMSE ($): {rmse_lasso_log_back:,.2f}")
+
+print("Results: ")
+summary = pd.DataFrame({
+    "Model": ["OLS (MLE)",
+        f"Ridge (closed, λ={best_lambda_ridge})",
+        f"Lasso (ISTA, λ≈{best_lambda_lasso:.1e})",
+        f"Ridge (log→back, λ={best_lambda_ridge_log})",
+        f"Lasso (log→back, λ≈{best_lambda_lasso_log:.1e})",],
+    "Test MSE": [ f"{mse_ols:.4f}",
+        f"{mse_ridge:.4f}",
+        f"{mse_lasso:.4f}",
+        f"{mse_ridge_log_back:.4f}",
+        f"{mse_lasso_log_back:.4f}", ],
+    "Test RMSE ($)": [ f"{rmse_ols:,.2f}",
+        f"{rmse_ridge:,.2f}",
+        f"{rmse_lasso:,.2f}",
+        f"{rmse_ridge_log_back:,.2f}",
+        f"{rmse_lasso_log_back:,.2f}", ]
+})
+print(summary.to_string(index=False))
