@@ -113,17 +113,14 @@ class DecisionTreeClassifier:
 
     def predict(self, X):
         return np.array([self._traverse_tree(x, self.root) for x in X])
-        if is_leaf_node:
+
+    def _traverse_tree(self, x, node):
+        """Follow the split rules until reaching a leaf."""
+        if node.is_leaf_node():
             return node.value
-        go_left = x[node.feature] <= node.threshold
-
-        if go_left:
-            predicted_label = self._traverse_tree(x, node.left)
-        else:
-            predicted_label = self._traverse_tree(x, node.right)
-
-
-        return predicted_label
+        if x[node.feature] <= node.threshold:
+            return self._traverse_tree(x, node.left)
+        return self._traverse_tree(x, node.right)
 
 
 if __name__ == "__main__":
