@@ -40,7 +40,7 @@ def accuracy(mlp, X, y):
     return correct/len(logits)
 
 
-def train(mlp, ss_fn, optimizer, X, y, batch_size=8, num_steps=100):
+def train(mlp, loss_fn, optimizer, X, y, batch_size=8, num_steps=100):
 
     set_seed()
     losses, accs = [], []
